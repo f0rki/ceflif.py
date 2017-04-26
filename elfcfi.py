@@ -32,6 +32,8 @@ else:
     handler.setFormatter(logging.Formatter(fmt))
     log.addHandler(handler)
 
+_ks = None
+
 
 def u8(x):
     return struct.unpack("B", x)[0]
@@ -55,66 +57,130 @@ def load_binary(path):
 
 def get_functions(binary):
     functions = {}
-    for sym in binary.exported_symbols:
-        log.debug("got symbol: {!r}".format(sym))
-        functions[sym.name] = sym.addr
+    for sym in binary.static_symbols:
+        if sym.type == lief.ELF.SYMBOL_TYPES.FUNC:
+            log.debug("got function symbol: {!r} 0x{:x}"
+                      .format(sym.name, sym.value))
+            functions[sym.name] = sym.value
     return functions
 
 
 def load_blobs(binary):
     subprocess.check_call("cd hooks && make", shell=True)
+
     entryhook = lief.parse('./hooks/setup_shadowmem')
-    eh = binary.insert_content(entryhook.segments[0].content)
+    # FIXME: insert_content returns the same offset every time
+    eh = binary.insert_content(entryhook.segments[0].data)
+    # FIXME: symbol adding doesn't seem to work
+    sym = lief.ELF.Symbol()
+    sym.name = "__ceflif_setup"
+    sym.value, sym.size = eh
+    binary.add_static_symbol(sym)
+
     verifier = lief.parse('./hooks/call_verifier')
-    vh = binary.insert_content(verifier.segments[0].content)
-    log.debug("inserted setup function at 0x{:x} and verifier at 0x{:x}"
-              .format(eh[0], vh[0]))
-    return eh, vh
+    vh = binary.insert_content(verifier.segments[0].data)
+    sym = lief.ELF.Symbol()
+    sym.name = "__ceflif_verify"
+    sym.value, sym.size = eh
+    binary.add_static_symbol(sym)
+
+    init = lief.parse('./hooks/shadow_init')
+    ih = binary.insert_content(init.segments[0].data)
+    sym = lief.ELF.Symbol()
+    sym.name = "__ceflif_init"
+    sym.value, sym.size = eh
+    binary.add_static_symbol(sym)
+
+    x = {'init': ih[0], 'setup': eh[0], 'verify': vh[0]}
+    log.debug(", ".join("{}: 0x{:x}".format(k, v) for k, v in x.iteritems()))
+    return x
 
 
 def ks_asm(code):
-    ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_32)
-    encoding, _ = ks.asm(code)
+    global _ks
+    if not _ks:
+        _ks = keystone.Ks(keystone.KS_ARCH_X86, keystone.KS_MODE_32)
+    # log.debug(code)
+    encoding, _ = _ks.asm(code)
     return encoding
 
 
-def hook_entrypoint(binary, hook):
-    asm = """
-    call 0x{:x}
-    jmp 0x{:x}
+def create_init_asm(funcs, initfunc):
+    tmpl = """
+    mov rdi, 0x{:x};
+    call 0x{:x};
     """
+    x = []
+    for func in funcs:
+        a = funcs[func]
+        if a > 0:
+            x.append(tmpl.format(a, initfunc))
+    return "".join(x)
+
+
+def hook_entrypoint(binary, hooks, funcs):
+    hook_virt = hooks['setup']
+    asm = """
+    call 0x{:x};
+    {}
+    jmp 0x{:x};
+    """
+    init_code = create_init_asm(funcs, hooks['init'])
     ep = binary.entrypoint
     log.debug("hooking entrypoint 0x{:x}".format(ep))
-    asm = asm.format(hook[0], ep)
+    asm = asm.format(hook_virt, init_code, ep)
+    log.debug(asm)
+    log.debug("assembling entry hook")
     ephook = ks_asm(asm)
+    log.debug("got {!r}".format(ephook))
     newep, _ = binary.insert_content(ephook)
-    binary.entrypoint = newep
+    # newep += 0x00400000
+    startsym = next(
+        iter(filter(lambda s: s.name == "_start", binary.static_symbols)))
+    startsym.value = newep
     log.debug("new entrypoint is 0x{:x}".format(newep))
 
 
 def find_calls(binary, func):
-    pass
+    return []
 
 
 def instrument_call(binary, call):
     pass
 
 
+def list_symbols(binary):
+    for sym in binary.static_symbols:
+        if sym.type == lief.ELF.SYMBOL_TYPES.FUNC:
+            log.info("{} / 0x{:x}".format(sym.name, sym.value))
+
+
 def main():
-    # 0. load binary
+    # load binary
     binary = load_binary(sys.argv[1])
-    # 1. find functions in binary
-    #   - iterate over symbols in binary
-    #   - gather a map symbols <-> address
+    list_symbols(binary)
+    # insert hooks
+    hooks = load_blobs(binary)
+    # find functions in binary
+    # - iterate over symbols in binary
+    # - gather a map symbols <-> address
     functions = get_functions(binary)
-    # 2. hook entry point to setup shadow memory
-    hook_entrypoint(binary)
-    # 3. instrument call instructions
-    #   - iterate over functions
-    #   - disassemble functions (capstone)
-    #   - for each call instruction
+    # hook entry point to setup shadow memory
+    hook_entrypoint(binary, hooks, functions)
+    # instrument call instructions
+    # - iterate over functions
+    # - disassemble functions (capstone)
+    # - for each call instruction
     #     - add hook to call verifier
     for func in functions:
         calls = find_calls(binary, func)
         for call in calls:
             instrument_call(binary, call)
+
+    list_symbols(binary)
+    log.info("saving result")
+    binary.write("tests/out")
+
+
+if __name__ == "__main__":
+    main()
