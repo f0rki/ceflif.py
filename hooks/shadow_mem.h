@@ -1,0 +1,3 @@
+#define SHADOW_ADDR 0x7FFF8000
+#define SHADOW_SIZE 0xffff000
+#define SHADOW_SCALE 8
